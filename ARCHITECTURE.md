@@ -65,42 +65,71 @@ User Input
 └──────┬───────────┘
        │
        ▼  (for each task in task-queue.json, BE first then FE)
-┌──────────────────────────────────────────────────────────┐
-│                    Orchestrator Loop                     │
-│                                                          │
-│  ┌─────────────────────────────────────────────────┐     │
-│  │  Context Builder (no LLM — deterministic)       │     │
-│  │  reads: registry files + journal (sliced)       │     │
-│  │  reads: files_to_read (actual file contents)    │     │
-│  │  assembles: minimal prompt context              │     │
-│  └────────────────────┬────────────────────────────┘     │
-│                       │                                  │
-│  ┌────────────────────▼────────────────────────────┐     │
-│  │  Builder Agent (BE or FE)                       │     │
-│  │  reads: context + skills/{role}/ + api slice    │     │
-│  │  writes: code files                             │     │
-│  │  returns: changes + registry_updates + decisions│     │
-│  └────────────────────┬────────────────────────────┘     │
-│                       │                                  │
-│                  git commit                              │
-│                       │                                  │
-│  ┌────────────────────▼────────────────────────────┐     │
-│  │  Reviewer Agent                                 │     │
-│  │  reads: git diff + skills + api slice           │     │
-│  │  returns: pass/fail + feedback + criteria       │     │
-│  └────────────────────┬────────────────────────────┘     │
-│                       │                                  │
-│              pass ────┤──── fail                         │
-│                │      │       │                          │
-│    apply registry     │   append to journal              │
-│    append journal     │   retry (max 2x)                 │
-│    next task  │       │   block if exhausted             │
-│               ▼       │                                  │
-└───────────────────────┴──────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────┐
+│                       Orchestrator Loop                           │
+│                                                                   │
+│  ┌──────────────────────────────────────────────────────────┐     │
+│  │  Context Builder  (no LLM — deterministic)               │     │
+│  │  reads: registry + journal (sliced) + files_to_read      │     │
+│  │  returns: ScopedContext { text, tokenCount, sections }   │     │
+│  └─────────────────────────┬────────────────────────────────┘     │
+│                            │                                      │
+│                   → beforeBuild hook (mutation)                   │
+│                     Pi context-compressor runs here               │
+│                            │                                      │
+│  ┌─────────────────────────▼────────────────────────────────┐     │
+│  │  Builder Agent (BE or FE)                                │     │
+│  │  reads: context + skills/{role}/ + api slice + feedback  │     │
+│  │  returns: changes + registry_updates + decisions         │     │
+│  └─────────────────────────┬────────────────────────────────┘     │
+│                            │                                      │
+│                   → afterBuild hook (notification)                │
+│                            │                                      │
+│  ┌─────────────────────────▼────────────────────────────────┐     │
+│  │  Static Validators  (no LLM)                             │     │
+│  │  ownership · schema · contracts · AST · test coverage    │     │
+│  │  errors → NormalizedFailure → onFailure hook             │     │
+│  └─────────────────────────┬────────────────────────────────┘     │
+│                            │                                      │
+│                   → beforeRuntime hook (gate)                     │
+│                            │                                      │
+│  ┌─────────────────────────▼────────────────────────────────┐     │
+│  │  Git Worktree  (isolated per attempt)                    │     │
+│  │  apply file changes → commit in worktree                 │     │
+│  └─────────────────────────┬────────────────────────────────┘     │
+│                            │                                      │
+│  ┌─────────────────────────▼────────────────────────────────┐     │
+│  │  Sandbox  (optional — see config)                        │     │
+│  │  install → typecheck → test → playwright                 │     │
+│  │  returns: SandboxArtifact → persisted to traces/         │     │
+│  └─────────────────────────┬────────────────────────────────┘     │
+│                            │                                      │
+│                   → afterRuntime hook (notification)              │
+│                   → onFailure hook if exitCode ≠ 0               │
+│                   → beforeRetry hook (mutation, Pi triage)        │
+│                            │                                      │
+│  ┌─────────────────────────▼────────────────────────────────┐     │
+│  │  Reviewer Agent                                          │     │
+│  │  reads: worktree diff + skills + api slice               │     │
+│  │  returns: pass/fail + feedback + criteria                │     │
+│  └─────────────────────────┬────────────────────────────────┘     │
+│                            │                                      │
+│                   → beforeCommit hook (gate — confidence gate)    │
+│                            │                                      │
+│              pass ─────────┤──── fail                            │
+│                │           │         │                            │
+│  cherry-pick to main       │    beforeRetry hook (mutation)       │
+│  apply registry            │    append journal                    │
+│  append journal            │    retry (max 2×)                    │
+│  next task                 │    block if exhausted                │
+│                            │                                      │
+└────────────────────────────┴──────────────────────────────────────┘
        │
        ▼
-  traces/{run-id}.json  +  cost summary
+  traces/<run-id>/<task-id>-attempt-<n>.json  +  cost summary
 ```
+
+Each attempt runs in a throwaway git worktree. The working tree is never dirtied by a failing attempt. On reviewer pass the worktree commit is cherry-picked into the main branch; on failure the worktree is deleted.
 
 ---
 
@@ -115,48 +144,85 @@ agent-system/
 │   │
 │   ├── agents/
 │   │   ├── planner.ts            # PRD agent + contract extractor
-│   │   ├── builder.ts            # BE/FE builder (role-aware)
-│   │   └── reviewer.ts           # Validator (uses Haiku — checklist operation)
+│   │   ├── builder.ts            # BE/FE builder — dispatches beforeBuild hook
+│   │   ├── reviewer.ts           # Validator (Haiku — checklist operation)
+│   │   ├── designer.ts           # FE design spec agent
+│   │   └── test-runner.ts        # Playwright runner — returns TestResult[]
 │   │
 │   ├── orchestrator/
 │   │   ├── run.ts                # top-level run loop, phases, cost summary
-│   │   └── step-runner.ts        # single task: build → commit → review → retry
+│   │   └── step-runner.ts        # per-task: worktree → sandbox → hooks → review → cherry-pick
+│   │
+│   ├── sandbox/
+│   │   └── executor.ts           # Docker/host sandbox — returns SandboxArtifact
 │   │
 │   ├── core/
 │   │   ├── types.ts              # all TypeScript types
-│   │   ├── schemas.ts            # all Zod schemas (runtime validation)
-│   │   ├── registry.ts           # registry reads/writes + context assembly
+│   │   ├── schemas.ts            # Zod schemas (runtime validation)
+│   │   ├── registry.ts           # registry reads/writes
 │   │   ├── router.ts             # Anthropic SDK + model tier routing + token tracking
-│   │   ├── git.ts                # git add/commit/diff/init
+│   │   ├── git.ts                # git ops including worktree create/remove/cherry-pick
 │   │   ├── skills.ts             # skill file loader
-│   │   └── logger.ts             # run trace writer
+│   │   ├── config.ts             # AgentConfig loader (env + file merge)
+│   │   ├── budget.ts             # monthly spend tracking and enforcement
+│   │   ├── logger.ts             # RunTrace writer
+│   │   ├── workspace.ts          # monorepo workspace resolution
+│   │   │
+│   │   ├── context/
+│   │   │   ├── scoped-context.ts # deterministic context assembly → ScopedContext
+│   │   │   └── types.ts          # ScopedContext { text, tokenCount, sections }
+│   │   │
+│   │   ├── failures/
+│   │   │   ├── types.ts          # NormalizedFailure, SandboxArtifact, TestResult, BrowserLog
+│   │   │   └── normalize.ts      # ValidationError → NormalizedFailure adapters
+│   │   │
+│   │   ├── hooks/
+│   │   │   ├── types.ts          # HookName, NotificationHook, GateHook, MutationHook
+│   │   │   ├── contracts.ts      # 8 hook payload types (BeforeBuildHook … BeforeCommitHook)
+│   │   │   ├── hookPolicies.ts   # per-hook failure policy (fail-open/closed/passthrough/ignore)
+│   │   │   ├── registry.ts       # hookRegistry singleton — register / get / clear
+│   │   │   └── dispatcher.ts     # dispatchMutation / dispatchGate / dispatchNotification
+│   │   │
+│   │   ├── confidence/
+│   │   │   └── types.ts          # ConfidenceResult { score, tier, signals, explanation }
+│   │   │
+│   │   ├── retry/
+│   │   │   └── types.ts          # RetryHistory, DiagnosisRecord, BuilderRetryInput
+│   │   │
+│   │   ├── observability/
+│   │   │   ├── playwright-parser.ts  # Playwright JSON → TestResult[] + attachments
+│   │   │   └── artifact-store.ts     # save/load SandboxArtifact to traces/
+│   │   │
+│   │   ├── kernel/
+│   │   │   └── ownership.ts      # file → task ownership index + staleness tracking
+│   │   │
+│   │   ├── validation/
+│   │   │   └── static-validators.ts  # ownership · schema · contracts · AST · test coverage
+│   │   │
+│   │   └── attribution/
+│   │       └── regression.ts     # failing test → culprit task attribution
+│   │
+│   ├── integrations/
+│   │   └── pi/
+│   │       └── index.ts          # PiSkillInvoker interface + null PiClient (swap when ready)
 │   │
 │   ├── prompts/
-│   │   ├── planner.ts            # PRD + contract extractor prompts
-│   │   ├── builder.ts            # builder prompt (injects skills + context + feedback)
-│   │   └── reviewer.ts           # reviewer prompt
+│   │   ├── planner.ts
+│   │   ├── builder.ts
+│   │   └── reviewer.ts
 │   │
 │   └── utils/
 │       ├── parse.ts              # safe JSON parser with Zod validation
-│       ├── file.ts               # apply file changes to disk
-│       └── input.ts              # readline helpers (waitForEnter, askYesNo)
+│       ├── file.ts               # apply file changes (worktreeRoot-aware)
+│       └── input.ts              # readline helpers
 │
 ├── skills/
 │   ├── shared/
-│   │   ├── json-output.md        # always return valid JSON, no fences
-│   │   ├── git.md                # commit conventions, off-limits files
-│   │   ├── registry-awareness.md # how to use shared types, avoid duplication
-│   │   └── journal-decisions.md  # what belongs in decisions[]
-│   │
 │   ├── be/
-│   │   └── api-conventions.md    # response envelope, status codes, validation
-│   │
 │   ├── fe/
-│   │   ├── design-system.md      # ⭐ EDIT THIS — your colors, fonts, spacing
-│   │   └── component-rules.md    # component structure, form pattern, API client
-│   │
+│   ├── designer/
+│   ├── testing/
 │   └── planner/
-│       └── prd-format.md         # required PRD sections, step granularity rules
 │
 ├── docs/                         # generated per run (git-tracked)
 │   ├── prd.json
@@ -171,8 +237,10 @@ agent-system/
 │       ├── components-registry.json
 │       └── hooks-registry.json
 │
-└── traces/                       # run logs (gitignored)
-    └── run-{id}.json
+└── .agent/traces/                # run logs + sandbox artifacts (gitignored)
+    └── <run-id>/
+        ├── run-<run-id>.json     # RunTrace (LLM cost, AttemptTrace[], artifactRefs)
+        └── <task-id>-attempt-<n>.json  # SandboxArtifact
 ```
 
 ---
@@ -550,3 +618,201 @@ When a run is blocked, the task queue has the last known state. A `agent resume`
 
 ### Parallel execution
 Tasks with no shared `files_to_touch` and no `depends_on` overlap can run in parallel. The task queue dependency graph already encodes this — a parallel executor would just process independent tasks concurrently rather than sequentially.
+
+---
+
+## 15. Task State Machine
+
+Tasks transition through an extended state set. States added in the Pi/sandbox integration are marked *.
+
+| State | Meaning |
+|---|---|
+| `pending` | Not yet started |
+| `in_progress` | Build attempt in progress |
+| `pass` | Reviewer passed; commit cherry-picked to main |
+| `blocked` | Exhausted retry budget — manual intervention needed |
+| `manually_completed` | Developer marked done outside the agent loop |
+| `retrying` * | Pi classified failure as retryable; retry underway |
+| `escalated` * | Pi classified failure as requiring human escalation |
+| `awaiting_approval` * | Confidence gate denied auto-commit; pending sign-off |
+| `runtime_failed` * | Sandbox failed outside the retry budget |
+
+---
+
+## 16. Hook System
+
+Hooks are the primary extension point for middleware (Pi, observability, CI gates). The dispatcher handles three semantically distinct hook classes with different composition rules and failure policies.
+
+### Hook classes
+
+| Class | Composition | On error |
+|---|---|---|
+| `NotificationHook<T>` | Fan-out parallel | `ignore` — swallow silently |
+| `GateHook<T>` | Short-circuit on first deny | `fail-open` or `fail-closed` per hook |
+| `MutationHook<T>` | Pipeline — outputₙ → inputₙ₊₁ | `passthrough` — return input unchanged |
+
+### Canonical hook sequence
+
+| Hook | Type | Blocks | Purpose |
+|---|---|---|---|
+| `beforeBuild` | Mutation | Yes | Pi context-compressor; retry-focused context shaping |
+| `afterBuild` | Notification | No | Telemetry |
+| `beforeRuntime` | Gate | Yes | Abort unsafe sandbox launch |
+| `afterRuntime` | Notification | No | Artifact emission to observability systems |
+| `onFailure` | Notification | No | Send `NormalizedFailure` + `SandboxArtifact` to Pi |
+| `beforeRetry` | Mutation | Yes | Pi injects structured repair feedback into builder prompt |
+| `afterRetry` | Notification | No | Record retry outcome |
+| `beforeCommit` | Gate | Yes | **Confidence gate** — deny blocks auto-commit |
+
+### Registering a hook
+
+```typescript
+import { hookRegistry } from "./src/core/hooks/registry.js"
+
+hookRegistry.register(
+  "beforeRetry",
+  async (payload) => {
+    // call Pi, mutate payload.retryInput.feedback, return payload
+    return payload
+  },
+  { priority: 10, timeoutMs: 5000 }
+)
+```
+
+The `beforeCommit` gate uses a `fail-closed` policy — a Pi timeout blocks auto-commit rather than allowing an unreviewed commit through.
+
+---
+
+## 17. Runtime Sandbox
+
+The sandbox runs build outputs in isolation before the LLM reviewer sees them. Each attempt gets a dedicated git worktree; the main working tree is never modified by a failing attempt.
+
+### Worktree lifecycle
+
+```
+create worktree (temp dir, new branch)
+    ↓
+apply file changes into worktree
+    ↓
+commit in worktree
+    ↓
+sandbox phases run in worktree directory
+    ↓
+pass → cherry-pick commit to main → remove worktree
+fail → discard worktree (no trace on main)
+```
+
+### Sandbox phases
+
+| Phase | Default command | Stops on failure |
+|---|---|---|
+| install | `npm install` | Yes |
+| typecheck | `npm run typecheck` | Yes |
+| test | `npm test` | Yes |
+| playwright | `npx playwright test` | Yes |
+
+Configure via `sandbox.commands` in `.agent/config.json`. Set `sandbox.docker: true` to run phases inside `mcr.microsoft.com/playwright/node:lts-jammy` instead of on the host. Omit the `sandbox` block to skip sandbox execution and use the static validation + LLM review path only.
+
+### `SandboxArtifact`
+
+```typescript
+type SandboxArtifact = {
+  runId: string
+  stdout: string
+  stderr: string
+  exitCode: number
+  screenshots: string[]     // Playwright attachment paths
+  traces: string[]          // Playwright .zip trace files
+  testResults?: TestResult[]
+  browserConsole?: BrowserLog[]
+  metrics: { durationMs: number; memoryMb: number }
+}
+```
+
+Persisted immediately after each run to `.agent/traces/<run-id>/<task-id>-attempt-<n>.json`. `AttemptTrace.artifactRef` links every LLM review to its sandbox run.
+
+---
+
+## 18. Observability Core
+
+### `TestResult` — canonical test primitive
+
+```typescript
+type TestResult = {
+  name: string
+  status: "passed" | "failed" | "skipped" | "timed_out"
+  durationMs: number
+  error?: string      // full message + stack trace (not truncated)
+  file?: string
+}
+```
+
+`TestResult[]` replaces the legacy `FailedTest[]` (failures only). `FailedTest` is preserved for backward compatibility and is derived from `TestResult` at the normalization boundary.
+
+### `NormalizedFailure` — canonical failure primitive
+
+All failure sources — static validators, sandbox runtime, LLM reviewer — normalize into one type before entering the retry loop or being dispatched to hooks:
+
+```typescript
+type NormalizedFailure = {
+  id: string
+  source: "static" | "runtime" | "test" | "llm-review"
+  phase: "install" | "typecheck" | "lint" | "test" | "playwright" | "review"
+  code: string
+  message: string
+  file?: string
+  stackTrace?: string
+  severity: "hard" | "soft"
+  artifactRefs?: { logs?: string[]; screenshots?: string[]; traces?: string[] }
+  timestamp: number
+}
+```
+
+### `ScopedContext` — structured context
+
+`buildScopedContext()` returns a structured type rather than a raw string:
+
+```typescript
+type ScopedContext = {
+  text: string           // assembled prompt text (what the builder receives)
+  tokenCount: number     // estimated tokens used
+  sections: {
+    sharedTypes: string
+    ownedFiles: string
+    journalSlice: string
+    fileContents: string // largest section — Pi compresses this first
+  }
+}
+```
+
+The `beforeBuild` mutation hook receives the full `ScopedContext`. When Pi's `context-compressor` skill is registered, it compresses sections exceeding the token threshold before the builder prompt is assembled.
+
+### Playwright reporter
+
+The Playwright JSON reporter requires the `PLAYWRIGHT_JSON_OUTPUT_NAME` environment variable to write its output to a file. The `--output` flag is the artifact directory (screenshots, traces), not the report file — using it for JSON output silently discards the report. Both the test runner and sandbox executor set the env var correctly and parse the resulting JSON into `TestResult[]` with full stack traces and attachment paths.
+
+---
+
+## 19. Pi Integration (planned — Phase 3)
+
+Pi acts as cognitive middleware between the sandbox and the retry loop. It is invoked through the hook system, not as a primary builder or architectural decision-maker.
+
+### Pi skill responsibilities
+
+| Skill | Hook | Input | Output |
+|---|---|---|---|
+| `runtime-debugger` | `onFailure` | `SandboxArtifact` | `PiDiagnosis` |
+| `context-compressor` | `beforeBuild` | `ScopedContext` | compressed context text |
+| `retry-classifier` | `beforeRetry` | `NormalizedFailure` + history | `retry` / `escalate` / `abort` / `request_approval` |
+
+### Invocation contract
+
+All Pi skills are called through a single synchronous interface:
+
+```typescript
+interface PiSkillInvoker {
+  invoke<TInput, TOutput>(skill: PiSkill, payload: TInput): Promise<TOutput>
+}
+```
+
+The null `PiClient` in `src/integrations/pi/index.ts` throws on any call. Swap it for the real SDK when the Pi integration is configured. All hook call sites are already in place — no step-runner changes needed to activate Pi.
