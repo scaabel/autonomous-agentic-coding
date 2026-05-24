@@ -1,0 +1,35 @@
+{
+  "model": "claude-sonnet-4-6",
+  "fastModel": "claude-haiku-4-5-20251001",
+  "maxRetries": 2,
+  "requireApproval": true,
+  "monthlyBudgetUsd": 20.00,
+
+  "docsDir": "docs",
+  "tracesDir": ".agent/traces",
+  "skillsDir": ".agent/skills",
+  "mockupsDir": ".agent/mockups",
+
+  "workspaces": {
+    "api": {
+      "root": "apps/api",
+      "framework": "express",
+      "language": "ts",
+      "srcDir": "src",
+      "testDir": "tests",
+      "skillsDir": ".agent/skills/api",
+      "agents": ["be"],
+      "doNotModify": ["src/index.ts", "src/middleware/error.ts"]
+    },
+    "mobile": {
+      "root": "apps/mobile",
+      "framework": "expo",
+      "language": "ts",
+      "srcDir": "src",
+      "testDir": "e2e",
+      "skillsDir": ".agent/skills/mobile",
+      "agents": ["fe"],
+      "doNotModify": ["app.json", "babel.config.js", "app/_layout.tsx"]
+    }
+  }
+}

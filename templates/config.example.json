@@ -1,0 +1,15 @@
+{
+  "model": "claude-sonnet-4-6",
+  "fastModel": "claude-haiku-4-5-20251001",
+  "maxRetries": 2,
+  "requireApproval": true,
+  "monthlyBudgetUsd": 20.00,
+  "framework": "next",
+  "language": "ts",
+  "srcDir": "src",
+  "docsDir": "docs",
+  "tracesDir": ".agent/traces",
+  "skillsDir": ".agent/skills",
+  "mockupsDir": ".agent/mockups",
+  "testDir": "tests/e2e"
+}
