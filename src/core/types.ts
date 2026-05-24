@@ -6,7 +6,16 @@ export type ModelTier = "fast" | "smart"
 
 // ─── Task (unit of work in the queue) ────────────────────────────────────────
 
-export type TaskStatus = "pending" | "in_progress" | "pass" | "blocked" | "manually_completed"
+export type TaskStatus =
+  | "pending"
+  | "in_progress"
+  | "pass"
+  | "blocked"
+  | "manually_completed"
+  | "retrying"           // Pi classified failure as retryable; retry in progress
+  | "escalated"          // Pi classified failure as requiring human escalation
+  | "awaiting_approval"  // confidence gate denied auto-commit; pending human sign-off
+  | "runtime_failed"     // sandbox execution failed outside the retry budget
 
 export type TaskScope = {
   files_to_create: string[]
