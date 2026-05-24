@@ -6,6 +6,7 @@ import type {
   BeRegistry, FeRegistry, ComponentsRegistry,
   ComponentEntry, HooksRegistry, HookEntry, RegistryFileEntry,
 } from "../types.js"
+import type { ScopedContext } from "./types.js"
 import { readOwnershipIndex, getDependencyChain } from "../kernel/ownership.js"
 import { getRegistryPaths } from "../registry.js"
 import { resolveWorkspace, isMonorepo } from "../workspace.js"
@@ -21,11 +22,18 @@ function estimateTokens(text: string): number {
 
 // ─── Main entry ───────────────────────────────────────────────────────────────
 
-export async function buildScopedContext(task: Task): Promise<string> {
+export async function buildScopedContext(task: Task): Promise<ScopedContext> {
   const budget = TOKEN_BUDGETS[task.agent] ?? 5000
   const p = await getRegistryPaths()
-  const sections: string[] = []
   let usedTokens = 0
+
+  // Track content by semantic bucket for structured output + Pi compression
+  const buckets = {
+    sharedTypes: [] as string[],
+    ownedFiles:  [] as string[],
+    journalSlice: [] as string[],
+    fileContents: [] as string[],
+  }
 
   // Resolve workspace root for file loading
   let workspaceRoot: string | undefined
@@ -34,10 +42,10 @@ export async function buildScopedContext(task: Task): Promise<string> {
     workspaceRoot = ws.absoluteRoot
   }
 
-  function tryAdd(section: string): boolean {
-    const cost = estimateTokens(section)
+  function tryAdd(text: string, bucket: keyof typeof buckets): boolean {
+    const cost = estimateTokens(text)
     if (usedTokens + cost > budget) return false
-    sections.push(section)
+    buckets[bucket].push(text)
     usedTokens += cost
     return true
   }
@@ -45,38 +53,52 @@ export async function buildScopedContext(task: Task): Promise<string> {
   // 1. Workspace context header (monorepo only)
   if (task.workspace) {
     const wsHeader = await buildWorkspaceHeader(task.workspace)
-    if (wsHeader) tryAdd(wsHeader)
+    if (wsHeader) tryAdd(wsHeader, "ownedFiles")
   }
 
   // 2. Shared types (always highest priority)
   const s1 = await buildSharedTypesSection(p)
-  if (s1) tryAdd(s1)
+  if (s1) tryAdd(s1, "sharedTypes")
 
   // 3. Dependency-aware context
   const s2 = await buildDependencySection(task)
-  if (s2) tryAdd(s2)
+  if (s2) tryAdd(s2, "ownedFiles")
 
   // 4. Agent-role context
   if (task.agent === "be") {
     const s3 = await buildBeSection(task, p)
-    if (s3) tryAdd(s3)
+    if (s3) tryAdd(s3, "ownedFiles")
   }
   if (task.agent === "fe") {
     const s4 = await buildFeSection(task, p)
-    if (s4) tryAdd(s4)
+    if (s4) tryAdd(s4, "ownedFiles")
   }
 
   // 5. Journal entries
   const s5 = await buildJournalSection(task, p)
-  if (s5) tryAdd(s5)
+  if (s5) tryAdd(s5, "journalSlice")
 
   // 6. Actual file contents (relative to workspace root)
   for (const filePath of task.scope.files_to_read) {
     const s6 = await buildFileSection(filePath, workspaceRoot, budget - usedTokens)
-    if (s6) { if (!tryAdd(s6)) break }
+    if (s6) { if (!tryAdd(s6, "fileContents")) break }
   }
 
-  return sections.join("\n\n")
+  const sections = {
+    sharedTypes:  buckets.sharedTypes.join("\n\n"),
+    ownedFiles:   buckets.ownedFiles.join("\n\n"),
+    journalSlice: buckets.journalSlice.join("\n\n"),
+    fileContents: buckets.fileContents.join("\n\n"),
+  }
+
+  const text = [
+    sections.sharedTypes,
+    sections.ownedFiles,
+    sections.journalSlice,
+    sections.fileContents,
+  ].filter(Boolean).join("\n\n")
+
+  return { text, tokenCount: usedTokens, sections }
 }
 
 // ─── Section builders ─────────────────────────────────────────────────────────

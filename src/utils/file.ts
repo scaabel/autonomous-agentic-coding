@@ -10,10 +10,11 @@ import { resolveTaskFilePath } from "../core/workspace.js"
  */
 export async function applyChanges(
   changes: Change[],
-  workspace?: string
+  workspace?: string,
+  worktreeRoot?: string  // when set, writes into the worktree instead of projectRoot
 ): Promise<void> {
   for (const change of changes) {
-    const absolutePath = await resolveTaskFilePath(change.file, workspace)
+    const absolutePath = await resolveTaskFilePath(change.file, workspace, worktreeRoot)
 
     switch (change.action) {
       case "create":

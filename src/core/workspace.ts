@@ -71,16 +71,23 @@ export async function isMonorepo(): Promise<boolean> {
 
 export async function resolveTaskFilePath(
   filePath: string,
-  workspaceName: string | undefined
+  workspaceName: string | undefined,
+  rootOverride?: string  // replaces projectRoot when writing into a git worktree
 ): Promise<string> {
+  const config = await loadConfig()
+  const projectRoot = rootOverride ?? config.projectRoot
+
   if (!workspaceName) {
-    // Single-project mode: relative to cwd
-    const config = await loadConfig()
-    return path.join(config.projectRoot, filePath)
+    return path.join(projectRoot, filePath)
   }
 
-  const workspace = await resolveWorkspace(workspaceName)
-  return path.join(workspace.absoluteRoot, filePath)
+  // Monorepo: workspace.root is relative to projectRoot (e.g. "apps/api")
+  const def = config.workspaces?.[workspaceName]
+  if (!def) {
+    const ws = await resolveWorkspace(workspaceName)
+    return path.join(projectRoot, path.relative(config.projectRoot, ws.absoluteRoot), filePath)
+  }
+  return path.join(projectRoot, def.root, filePath)
 }
 
 export async function toRelativeTaskPath(
