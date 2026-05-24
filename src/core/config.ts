@@ -28,6 +28,19 @@ export type AgentConfig = {
   // Monorepo workspaces (optional — absence = single-project mode)
   workspaces?: Record<string, WorkspaceDefinition>
 
+  // Runtime sandbox (opt-in — default disabled)
+  sandbox?: {
+    docker: boolean           // true = run inside Docker container; false = run on host
+    image: string             // Docker image (ignored when docker: false)
+    commands: {
+      install: string
+      typecheck: string
+      test: string
+      playwright?: string     // omit to skip Playwright in sandbox
+    }
+    timeoutMs: number
+  }
+
   // Resolved at runtime
   projectRoot: string
   packageRoot: string
