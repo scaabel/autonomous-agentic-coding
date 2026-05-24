@@ -1,7 +1,9 @@
 import { execa } from "execa"
+import fs from "fs-extra"
 import path from "path"
 import type { AgentConfig } from "../core/config.js"
 import type { SandboxArtifact, TestResult } from "../core/failures/types.js"
+import { parsePlaywrightReport } from "../core/observability/playwright-parser.js"
 
 const DEFAULT_COMMANDS = {
   install:    "npm install",
@@ -87,24 +89,21 @@ async function runInDocker(
   }
 }
 
-// ─── Test result parsing ──────────────────────────────────────────────────────
-// Parses basic pass/fail lines from test output.
-// Full Playwright JSON parsing is Phase 2 (Observability Core).
+// ─── Playwright JSON report parsing ──────────────────────────────────────────
 
-function parseTestResults(stdout: string): TestResult[] {
-  const results: TestResult[] = []
-  // Match "✓ test name (Xms)" and "✗ test name" from common reporters
-  const passLine = /[✓✔]\s+(.+?)\s+\((\d+)ms\)/g
-  const failLine = /[✗✘×]\s+(.+?)(?:\s+\((\d+)ms\))?$/gm
-
-  let m: RegExpExecArray | null
-  while ((m = passLine.exec(stdout)) !== null) {
-    results.push({ name: m[1], status: "passed", durationMs: parseInt(m[2], 10) })
+async function parsePlaywrightOutput(
+  worktreePath: string,
+  reportPath: string
+): Promise<{ testResults: TestResult[]; screenshots: string[]; traces: string[] }> {
+  try {
+    if (!(await fs.pathExists(reportPath))) return { testResults: [], screenshots: [], traces: [] }
+    const raw = await fs.readJSON(reportPath)
+    const parsed = parsePlaywrightReport(raw)
+    await fs.remove(reportPath).catch(() => {})
+    return { testResults: parsed.testResults, screenshots: parsed.screenshots, traces: parsed.traces }
+  } catch {
+    return { testResults: [], screenshots: [], traces: [] }
   }
-  while ((m = failLine.exec(stdout)) !== null) {
-    results.push({ name: m[1], status: "failed", durationMs: m[2] ? parseInt(m[2], 10) : 0 })
-  }
-  return results
 }
 
 // ─── Main entry ───────────────────────────────────────────────────────────────
@@ -119,56 +118,78 @@ export async function executeSandbox(
   const cmds = sandboxCfg?.commands ?? DEFAULT_COMMANDS
   const timeoutMs = sandboxCfg?.timeoutMs ?? DEFAULT_TIMEOUT
 
-  const phases = [
-    cmds.install,
-    cmds.typecheck,
-    cmds.test,
-    ...(cmds.playwright ? [cmds.playwright] : []),
-  ]
+  // Playwright writes its JSON report to this path via PLAYWRIGHT_JSON_OUTPUT_NAME
+  const playwrightReportPath = path.join(worktreePath, ".agent-playwright-report.json")
+
+  // Non-Playwright phases (install, typecheck, test)
+  const prePhases = [cmds.install, cmds.typecheck, cmds.test]
+  // Playwright phase gets the env var injected
+  const playwrightCmd = cmds.playwright
 
   let stdout = ""
   let stderr = ""
   let exitCode = 0
+  let testResults: TestResult[] = []
+  let screenshots: string[] = []
+  let traces: string[] = []
 
   if (sandboxCfg?.docker) {
-    // Docker mode: single container run, all phases chained
-    const result = await runInDocker(
-      worktreePath,
-      phases,
-      sandboxCfg.image ?? DEFAULT_IMAGE,
-      timeoutMs
+    // Docker mode: chain all phases except Playwright, then run Playwright separately
+    // so we can inject PLAYWRIGHT_JSON_OUTPUT_NAME into the container env
+    const preResult = await runInDocker(
+      worktreePath, prePhases, sandboxCfg.image ?? DEFAULT_IMAGE, timeoutMs
     )
-    stdout = result.stdout
-    stderr = result.stderr
-    exitCode = result.exitCode
+    stdout = preResult.stdout
+    stderr = preResult.stderr
+    exitCode = preResult.exitCode
+
+    if (exitCode === 0 && playwrightCmd) {
+      const pwResult = await runInDocker(
+        worktreePath, [playwrightCmd], sandboxCfg.image ?? DEFAULT_IMAGE, timeoutMs
+      )
+      stdout += pwResult.stdout ? `\n[playwright]\n${pwResult.stdout}` : ""
+      stderr += pwResult.stderr ? `\n[playwright]\n${pwResult.stderr}` : ""
+      if (pwResult.exitCode !== 0) exitCode = pwResult.exitCode
+      ;({ testResults, screenshots, traces } = await parsePlaywrightOutput(worktreePath, playwrightReportPath))
+    }
   } else {
-    // Host mode: run each phase sequentially in the worktree directory
-    for (const cmd of phases) {
+    // Host mode: sequential phases, stop on first failure
+    for (const cmd of prePhases) {
       const result = await runPhase(cmd, worktreePath, timeoutMs)
       stdout += result.stdout ? `\n[${cmd}]\n${result.stdout}` : ""
       stderr += result.stderr ? `\n[${cmd}]\n${result.stderr}` : ""
-      if (result.exitCode !== 0) {
-        exitCode = result.exitCode
-        break // stop on first failing phase
-      }
+      if (result.exitCode !== 0) { exitCode = result.exitCode; break }
+    }
+
+    if (exitCode === 0 && playwrightCmd) {
+      const [bin, ...args] = playwrightCmd.split(" ")
+      try {
+        const pwResult = await execa(bin, [...args, "--reporter=json"], {
+          cwd: worktreePath,
+          timeout: timeoutMs,
+          reject: false,
+          all: true,
+          env: { ...process.env, PLAYWRIGHT_JSON_OUTPUT_NAME: playwrightReportPath },
+        })
+        stdout += pwResult.stdout ? `\n[playwright]\n${pwResult.stdout}` : ""
+        stderr += pwResult.stderr ? `\n[playwright]\n${pwResult.stderr}` : ""
+        if (pwResult.exitCode !== 0) exitCode = pwResult.exitCode
+      } catch { exitCode = 1 }
+      ;({ testResults, screenshots, traces } = await parsePlaywrightOutput(worktreePath, playwrightReportPath))
     }
   }
-
-  const testResults = parseTestResults(stdout)
-  // Playwright screenshots/traces are written to the worktree's playwright-report dir
-  const reportDir = path.join(worktreePath, "playwright-report")
 
   return {
     runId,
     stdout: stdout.trim(),
     stderr: stderr.trim(),
     exitCode,
-    screenshots: [], // populated in Phase 2 by scanning reportDir
-    traces:      [], // populated in Phase 2 by scanning reportDir
+    screenshots,
+    traces,
     testResults,
     metrics: {
       durationMs: Date.now() - started,
-      memoryMb:   0, // populated in Phase 2 via docker stats
+      memoryMb:   0,
     },
   }
 }

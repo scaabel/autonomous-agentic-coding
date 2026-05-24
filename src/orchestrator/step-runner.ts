@@ -25,6 +25,7 @@ import { buildScopedContext } from "../core/context/scoped-context.js"
 import { runStaticValidation } from "../core/validation/static-validators.js"
 import { normalizeValidationError, normalizeValidationWarning, normalizeRuntimeError } from "../core/failures/normalize.js"
 import { executeSandbox } from "../sandbox/executor.js"
+import { saveArtifact } from "../core/observability/artifact-store.js"
 import { loadConfig } from "../core/config.js"
 import {
   dispatchMutation,
@@ -225,9 +226,14 @@ export async function runStep(
       }
 
       // ── Sandbox execution (when configured) ───────────────────────────────
+      let artifactRef: string | undefined
       if (config.sandbox) {
         spinner.text = `  [${task.agent.toUpperCase()}] ${task.title} — sandbox...`
-        const artifact = await executeSandbox(worktreePath, `${task.id}-attempt-${attempt}`, config)
+        const runId = `${task.id}-${attempt}`
+        const artifact = await executeSandbox(worktreePath, runId, config)
+
+        // Persist artifact before dispatching hooks so hook handlers can read it
+        artifactRef = await saveArtifact(artifact, task.id, attempt)
 
         await dispatchNotification("afterRuntime", { task, artifact })
 
@@ -241,7 +247,11 @@ export async function runStep(
             "test",
             { code: "SANDBOX_FAILURE", severity: "hard" }
           )
-          failure.artifactRefs = { logs: [`traces/${task.id}-attempt-${attempt}.log`] }
+          failure.artifactRefs = {
+            logs:        artifactRef ? [artifactRef] : [],
+            screenshots: artifact.screenshots,
+            traces:      artifact.traces,
+          }
           retryHistory.failures.push(failure)
 
           await dispatchNotification("onFailure", { task, failure, artifact })
@@ -289,6 +299,7 @@ export async function runStep(
         input_tokens: buildRes.input_tokens + reviewRes.input_tokens,
         output_tokens: buildRes.output_tokens + reviewRes.output_tokens,
         timestamp: new Date().toISOString(),
+        artifactRef,
       }
       trace.attempts.push(attemptTrace)
 

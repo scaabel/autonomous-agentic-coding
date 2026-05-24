@@ -199,6 +199,7 @@ export type AttemptTrace = {
   input_tokens: number
   output_tokens: number
   timestamp: string
+  artifactRef?: string   // path to the persisted SandboxArtifact JSON for this attempt
 }
 
 export type StepTrace = {
@@ -265,6 +266,7 @@ export type TestRunResult = {
   skipped: number
   duration_ms: number
   failed_tests: FailedTest[]
+  testResults?: import("./failures/types.js").TestResult[]  // canonical per-test results (Phase 2+)
   culprit_task_id?: string     // set when regression is detected
 }
 
